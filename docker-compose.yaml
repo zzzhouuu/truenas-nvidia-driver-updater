@@ -1,0 +1,13 @@
+services:
+  nvidia-builder:
+    build: .
+    container_name: truenas-nvidia-builder
+    environment:
+      - NVIDIA_VERSION=595.58.03
+      - TRUENAS_VERSION=25.10.3
+      - TRUENAS_CODENAME=Goldeye
+    volumes:
+      # If truenas.update exists here, it will be used instead of downloading
+      - .:/workspace
+      - ./output:/output
+    privileged: true

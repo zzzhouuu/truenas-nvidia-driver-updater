@@ -22,3 +22,4 @@ services:
       - .:/workspace
       - ./output:/output
     privileged: true
+

@@ -68,13 +68,25 @@ TrueNAS NVIDIA Driver Updater — Interactive Configuration Wizard
 Usage:
   ./configure.sh              Launch the interactive wizard
   ./configure.sh --no-whiptail  Force plain bash menus (skip whiptail)
+  ./configure.sh --reconfigure  Quick-change a single setting in existing config
   ./configure.sh --help       Show this help message
 
+Non-interactive mode (for automation / CI):
+  ./configure.sh --truenas 25.10.3.1 --nvidia 595.80
+  ./configure.sh --truenas 25.10.3.1 --nvidia 595.80 --module open --embed false
+
+  All flags:
+    --truenas VERSION     TrueNAS version (e.g. 25.10.3.1)
+    --nvidia VERSION      NVIDIA driver version (e.g. 595.80)
+    --module TYPE         Kernel module type: open (default) or proprietary
+    --embed true|false    Embed nvidia.raw in truenas.update (default: false)
+
 The wizard will:
-  1. Fetch available TrueNAS versions from download.truenas.com
-  2. Fetch available NVIDIA driver versions from download.nvidia.com
-  3. Let you select options from interactive menus
-  4. Generate docker-compose.yaml with your choices
+  1. Detect your system (auto-detect TrueNAS version and GPU if running locally)
+  2. Fetch available TrueNAS versions from download.truenas.com
+  3. Fetch available NVIDIA driver versions from download.nvidia.com
+  4. Let you select options from interactive menus
+  5. Generate docker-compose.yaml with your choices
 
 UI modes (auto-detected):
   - If whiptail is available: full TUI dialog boxes with scrolling
@@ -92,12 +104,30 @@ EOF
     exit 0
 }
 
+# ── CLI variables for non-interactive mode ───────────────────────────────────
+CLI_TRUENAS=""
+CLI_NVIDIA=""
+CLI_MODULE=""
+CLI_EMBED=""
+CLI_RECONFIGURE=false
+
 # ── parse arguments ──────────────────────────────────────────────────────────
-for arg in "$@"; do
-    case "${arg}" in
-        --help|-h) show_help ;;
-        --no-whiptail) FORCE_BASH=true ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h)        show_help ;;
+        --no-whiptail)    FORCE_BASH=true ;;
+        --reconfigure)    CLI_RECONFIGURE=true ;;
+        --truenas)        CLI_TRUENAS="$2"; shift ;;
+        --nvidia)         CLI_NVIDIA="$2"; shift ;;
+        --module)         CLI_MODULE="$2"; shift ;;
+        --embed)          CLI_EMBED="$2"; shift ;;
+        --truenas=*)      CLI_TRUENAS="${1#*=}" ;;
+        --nvidia=*)       CLI_NVIDIA="${1#*=}" ;;
+        --module=*)       CLI_MODULE="${1#*=}" ;;
+        --embed=*)        CLI_EMBED="${1#*=}" ;;
+        *) warn "Unknown argument: $1" ;;
     esac
+    shift
 done
 
 # ── detect UI mode ───────────────────────────────────────────────────────────
@@ -580,22 +610,65 @@ _ui_menu_whiptail() {
     local title="$1"; shift
     local prompt="$1"; shift
 
+    # Store all items for potential filtering
+    local -a all_args=("$@")
+
     wt_size
 
-    local choice=""
-    choice=$(whiptail --title "${title}" --menu "${prompt}" \
-        ${WT_HEIGHT} ${WT_WIDTH} ${WT_MENU_HEIGHT} \
-        "$@" \
-        "MANUAL" "✎ Enter version manually" \
-        3>&1 1>&2 2>&3) || { _wt_result=""; return 1; }
-
-    if [[ "${choice}" == "MANUAL" ]]; then
-        choice=$(whiptail --title "${title}" --inputbox \
-            "Enter version manually:" 8 ${WT_WIDTH} "" \
+    while true; do
+        local choice=""
+        choice=$(whiptail --title "${title}" --menu "${prompt}" \
+            ${WT_HEIGHT} ${WT_WIDTH} ${WT_MENU_HEIGHT} \
+            "${all_args[@]}" \
+            "FILTER" "🔍 Filter / search versions" \
+            "MANUAL" "✎ Enter version manually" \
             3>&1 1>&2 2>&3) || { _wt_result=""; return 1; }
-    fi
 
-    _wt_result="${choice}"
+        if [[ "${choice}" == "FILTER" ]]; then
+            local filter=""
+            filter=$(whiptail --title "Filter" --inputbox \
+                "Type a version number, codename, or keyword to filter.\nLeave empty to reset." \
+                10 ${WT_WIDTH} "" \
+                3>&1 1>&2 2>&3) || continue
+
+            if [[ -n "${filter}" ]]; then
+                # Rebuild args with only matching items
+                local -a filtered_args=()
+                local idx=0
+                while [[ ${idx} -lt ${#all_args[@]} ]]; do
+                    local tag="${all_args[$idx]}"
+                    local desc="${all_args[$((idx+1))]}"
+                    if [[ "${tag}" == *"${filter}"* ]] || [[ "${desc,,}" == *"${filter,,}"* ]]; then
+                        filtered_args+=("${tag}" "${desc}")
+                    fi
+                    (( idx += 2 ))
+                done
+                if [[ ${#filtered_args[@]} -gt 0 ]]; then
+                    all_args=("${filtered_args[@]}")
+                    prompt="Filtered (${#filtered_args[@]}/$(($# / 2)) matches for '${filter}'):"
+                else
+                    whiptail --title "No matches" --msgbox \
+                        "No versions matched '${filter}'. Showing full list." \
+                        8 ${WT_WIDTH} 3>&1 1>&2 2>&3
+                    all_args=("$@")
+                fi
+            else
+                # Reset filter
+                all_args=("$@")
+                prompt="$3"
+            fi
+            continue
+        fi
+
+        if [[ "${choice}" == "MANUAL" ]]; then
+            choice=$(whiptail --title "${title}" --inputbox \
+                "Enter version manually:" 8 ${WT_WIDTH} "" \
+                3>&1 1>&2 2>&3) || { _wt_result=""; return 1; }
+        fi
+
+        _wt_result="${choice}"
+        return 0
+    done
 }
 
 _ui_menu_bash() {
@@ -604,22 +677,29 @@ _ui_menu_bash() {
     local prompt="$1"; shift
 
     # Build display items from tag/desc pairs
-    local -a tags=() descs=() display=()
+    local -a all_tags=() all_descs=() all_display=()
     while [[ $# -gt 0 ]]; do
-        tags+=("$1")
-        descs+=("${2:-}")
+        all_tags+=("$1")
+        all_descs+=("${2:-}")
         local d="$1"
         [[ -n "${2:-}" ]] && d="${d}  ${2}"
-        display+=("${d}")
+        all_display+=("${d}")
         shift 2 || shift
     done
 
-    local total=${#display[@]}
+    # Active filter state (working copies that can be filtered)
+    local -a tags=("${all_tags[@]}")
+    local -a display=("${all_display[@]}")
+    local active_filter=""
+
     local page_size=20
     local page=0
-    local max_page=$(( (total - 1) / page_size ))
 
     while true; do
+        local total=${#display[@]}
+        local max_page=$(( total > 0 ? (total - 1) / page_size : 0 ))
+        [[ ${page} -gt ${max_page} ]] && page=0
+
         local start=$(( page * page_size ))
         local end=$(( start + page_size ))
         [[ ${end} -gt ${total} ]] && end=${total}
@@ -633,7 +713,7 @@ _ui_menu_bash() {
             page_tags+=("${tags[$i]}")
         done
 
-        # Navigation options
+        # Navigation and utility options
         if [[ ${page} -gt 0 ]]; then
             page_items+=("◀ Previous page")
             page_tags+=("__PREV__")
@@ -642,10 +722,16 @@ _ui_menu_bash() {
             page_items+=("▶ Next page  (showing $((start+1))–${end} of ${total})")
             page_tags+=("__NEXT__")
         fi
+        page_items+=("🔍 Filter versions")
+        page_tags+=("__FILTER__")
         page_items+=("✎ Enter manually")
         page_tags+=("__MANUAL__")
 
-        echo -e "${DIM}  Page $((page+1)) of $((max_page+1)) — showing $((start+1))–${end} of ${total}${NC}"
+        if [[ -n "${active_filter}" ]]; then
+            echo -e "${DIM}  Filter: '${active_filter}' — ${total} matches (showing $((start+1))–${end})${NC}"
+        else
+            echo -e "${DIM}  Page $((page+1)) of $((max_page+1)) — showing $((start+1))–${end} of ${total}${NC}"
+        fi
 
         PS3="  #? "
         select choice in "${page_items[@]}"; do
@@ -669,6 +755,36 @@ _ui_menu_bash() {
             case "${sel_tag}" in
                 __PREV__)   (( page-- )); break ;;
                 __NEXT__)   (( page++ )); break ;;
+                __FILTER__)
+                    echo ""
+                    read -rp "  Filter (empty to reset): " filter_input
+                    if [[ -n "${filter_input}" ]]; then
+                        active_filter="${filter_input}"
+                        tags=() display=()
+                        for (( i = 0; i < ${#all_tags[@]}; i++ )); do
+                            if [[ "${all_tags[$i],,}" == *"${filter_input,,}"* ]] \
+                               || [[ "${all_display[$i],,}" == *"${filter_input,,}"* ]]; then
+                                tags+=("${all_tags[$i]}")
+                                display+=("${all_display[$i]}")
+                            fi
+                        done
+                        if [[ ${#tags[@]} -eq 0 ]]; then
+                            echo -e "  ${YELLOW}No matches for '${filter_input}'. Showing all.${NC}"
+                            tags=("${all_tags[@]}")
+                            display=("${all_display[@]}")
+                            active_filter=""
+                        else
+                            echo -e "  ${GREEN}Found ${#tags[@]} matches.${NC}"
+                        fi
+                        page=0
+                    else
+                        tags=("${all_tags[@]}")
+                        display=("${all_display[@]}")
+                        active_filter=""
+                        page=0
+                    fi
+                    break
+                    ;;
                 __MANUAL__)
                     echo ""
                     read -rp "  Enter version: " manual_input
@@ -812,6 +928,70 @@ EOF
 }
 
 # =============================================================================
+# System Auto-Detection
+# =============================================================================
+
+# Detect TrueNAS version if running on a TrueNAS system
+detect_truenas_version() {
+    declare -g DETECTED_TRUENAS_VERSION=""
+
+    # Method 1: /etc/version (present on TrueNAS SCALE)
+    if [[ -f /etc/version ]]; then
+        DETECTED_TRUENAS_VERSION="$(cat /etc/version 2>/dev/null | tr -d '[:space:]')" || true
+    fi
+
+    # Method 2: midclt (TrueNAS middleware CLI)
+    if [[ -z "${DETECTED_TRUENAS_VERSION}" ]] && command -v midclt &>/dev/null; then
+        DETECTED_TRUENAS_VERSION="$(midclt call system.version 2>/dev/null | tr -d '"[:space:]')" || true
+    fi
+
+    if [[ -n "${DETECTED_TRUENAS_VERSION}" ]]; then
+        ok "Detected TrueNAS version: ${DETECTED_TRUENAS_VERSION}"
+    fi
+}
+
+# Detect NVIDIA GPU model via lspci
+detect_nvidia_gpu() {
+    declare -g DETECTED_GPU_MODEL=""
+
+    if ! command -v lspci &>/dev/null; then
+        return
+    fi
+
+    # Get NVIDIA VGA/3D controller entries
+    DETECTED_GPU_MODEL="$(lspci 2>/dev/null \
+        | grep -iE '(VGA|3D|Display).*NVIDIA' \
+        | sed 's/.*NVIDIA Corporation //' \
+        | head -1)" || true
+
+    if [[ -n "${DETECTED_GPU_MODEL}" ]]; then
+        ok "Detected GPU: NVIDIA ${DETECTED_GPU_MODEL}"
+    fi
+}
+
+# Read existing docker-compose.yaml values for reconfigure mode
+read_existing_config() {
+    local compose_file="$1"
+
+    declare -g EXISTING_TRUENAS="" EXISTING_NVIDIA="" EXISTING_MODULE="" EXISTING_EMBED="" EXISTING_CODENAME=""
+
+    [[ -f "${compose_file}" ]] || return 1
+
+    EXISTING_NVIDIA="$(grep 'NVIDIA_VERSION=' "${compose_file}" 2>/dev/null \
+        | grep -v '#' | head -1 | sed 's/.*NVIDIA_VERSION=//' | tr -d '[:space:]')" || true
+    EXISTING_TRUENAS="$(grep 'TRUENAS_VERSION=' "${compose_file}" 2>/dev/null \
+        | grep -v '#' | head -1 | sed 's/.*TRUENAS_VERSION=//' | tr -d '[:space:]')" || true
+    EXISTING_MODULE="$(grep 'NVIDIA_KERNEL_MODULE_TYPE=' "${compose_file}" 2>/dev/null \
+        | grep -v '#' | head -1 | sed 's/.*NVIDIA_KERNEL_MODULE_TYPE=//' | tr -d '[:space:]')" || true
+    EXISTING_EMBED="$(grep 'EMBED_NVIDIA_RAW_IN_UPDATE=' "${compose_file}" 2>/dev/null \
+        | grep -v '#' | head -1 | sed 's/.*EMBED_NVIDIA_RAW_IN_UPDATE=//' | tr -d '[:space:]')" || true
+    EXISTING_CODENAME="$(grep 'TRUENAS_CODENAME=' "${compose_file}" 2>/dev/null \
+        | grep -v '#' | head -1 | sed 's/.*TRUENAS_CODENAME=//' | tr -d '[:space:]')" || true
+
+    return 0
+}
+
+# =============================================================================
 # Main Wizard
 # =============================================================================
 
@@ -821,25 +1001,177 @@ main() {
     detect_ui_mode
     detect_fetch_cmd
     info "Using ${FETCH_CMD} to fetch version lists"
+
+    # ── System auto-detection ────────────────────────────────────────────────
+    detect_truenas_version
+    detect_nvidia_gpu
     echo ""
 
-    # ── Check for existing config ────────────────────────────────────────────
+    # ── Paths ────────────────────────────────────────────────────────────────
     local script_dir=""
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     local compose_file="${script_dir}/docker-compose.yaml"
 
-    if [[ -f "${compose_file}" ]]; then
-        # Show current config
-        local current_nvidia current_truenas
-        current_nvidia="$(grep 'NVIDIA_VERSION=' "${compose_file}" 2>/dev/null \
-            | grep -v '#' | head -1 | sed 's/.*NVIDIA_VERSION=//' | tr -d '[:space:]')" || true
-        current_truenas="$(grep 'TRUENAS_VERSION=' "${compose_file}" 2>/dev/null \
-            | grep -v '#' | head -1 | sed 's/.*TRUENAS_VERSION=//' | tr -d '[:space:]')" || true
+    # ── Non-interactive mode ─────────────────────────────────────────────────
+    if [[ -n "${CLI_TRUENAS}" ]] && [[ -n "${CLI_NVIDIA}" ]]; then
+        info "Running in non-interactive mode"
 
-        if [[ -n "${current_nvidia}" ]] || [[ -n "${current_truenas}" ]]; then
+        local selected_truenas="${CLI_TRUENAS}"
+        local selected_nvidia="${CLI_NVIDIA}"
+        local selected_module_type="${CLI_MODULE:-open}"
+        local selected_embed="${CLI_EMBED:-false}"
+        local selected_cc=""
+
+        # Resolve codename
+        local major_minor=""
+        major_minor="$(echo "${selected_truenas}" | grep -oP '^\d+\.\d+' || true)"
+        local selected_codename="${VERSION_TO_CODENAME[${major_minor}]:-}"
+
+        ok "TrueNAS: ${selected_truenas}${selected_codename:+ (${selected_codename})}"
+        ok "NVIDIA:  ${selected_nvidia}"
+        ok "Module:  ${selected_module_type}"
+        ok "Embed:   ${selected_embed}"
+
+        generate_compose_yaml \
+            "${selected_nvidia}" \
+            "${selected_truenas}" \
+            "${selected_codename}" \
+            "${selected_module_type}" \
+            "${selected_embed}" \
+            "${selected_cc}" \
+            "${compose_file}"
+
+        ok "docker-compose.yaml generated!"
+        return 0
+    fi
+
+    # ── Reconfigure mode ─────────────────────────────────────────────────────
+    if [[ "${CLI_RECONFIGURE}" == true ]]; then
+        if ! read_existing_config "${compose_file}"; then
+            err "No docker-compose.yaml found. Run without --reconfigure first."
+            exit 1
+        fi
+
+        echo -e "  ${YELLOW}Current configuration:${NC}"
+        echo -e "    1) TrueNAS Version   : ${BOLD}${EXISTING_TRUENAS}${NC}"
+        echo -e "    2) NVIDIA Driver     : ${BOLD}${EXISTING_NVIDIA}${NC}"
+        echo -e "    3) Module Type       : ${BOLD}${EXISTING_MODULE}${NC}"
+        echo -e "    4) Embed in .update  : ${BOLD}${EXISTING_EMBED}${NC}"
+        echo ""
+
+        local reconfigure_what=""
+        if [[ "${UI_MODE}" == "whiptail" ]]; then
+            wt_size
+            reconfigure_what=$(whiptail --title "Reconfigure" \
+                --menu "Which setting would you like to change?" \
+                ${WT_HEIGHT} ${WT_WIDTH} 4 \
+                "truenas" "TrueNAS Version (currently: ${EXISTING_TRUENAS})" \
+                "nvidia" "NVIDIA Driver (currently: ${EXISTING_NVIDIA})" \
+                "module" "Module Type (currently: ${EXISTING_MODULE})" \
+                "embed" "Embed in .update (currently: ${EXISTING_EMBED})" \
+                3>&1 1>&2 2>&3) || { info "Cancelled."; exit 0; }
+        else
+            local -a reconf_options=(
+                "TrueNAS Version (${EXISTING_TRUENAS})"
+                "NVIDIA Driver (${EXISTING_NVIDIA})"
+                "Module Type (${EXISTING_MODULE})"
+                "Embed in .update (${EXISTING_EMBED})"
+            )
+            PS3="  Change which? "
+            select choice in "${reconf_options[@]}"; do
+                case "${REPLY}" in
+                    1) reconfigure_what="truenas"; break ;;
+                    2) reconfigure_what="nvidia"; break ;;
+                    3) reconfigure_what="module"; break ;;
+                    4) reconfigure_what="embed"; break ;;
+                    *) echo -e "  ${RED}Invalid selection.${NC}" ;;
+                esac
+            done
+        fi
+
+        local selected_truenas="${EXISTING_TRUENAS}"
+        local selected_codename="${EXISTING_CODENAME}"
+        local selected_nvidia="${EXISTING_NVIDIA}"
+        local selected_module_type="${EXISTING_MODULE}"
+        local selected_embed="${EXISTING_EMBED}"
+        local selected_cc=""
+
+        case "${reconfigure_what}" in
+            truenas)
+                if fetch_truenas_versions; then
+                    local -a truenas_menu_args=()
+                    for ver in "${TRUENAS_VERSIONS[@]}"; do
+                        local cn="${TRUENAS_VERSION_CODENAMES[${ver}]:-}"
+                        local tag="${TRUENAS_VERSION_TAGS[${ver}]:-}"
+                        local desc=""
+                        [[ -n "${cn}" ]] && desc="${cn}"
+                        [[ -n "${tag}" ]] && desc="${desc:+${desc}  }${tag}"
+                        truenas_menu_args+=("${ver}" "${desc}")
+                    done
+                    ui_menu selected_truenas "TrueNAS Version" \
+                        "Select new TrueNAS version:" "${truenas_menu_args[@]}"
+                    selected_codename="${TRUENAS_VERSION_CODENAMES[${selected_truenas}]:-}"
+                    if [[ -z "${selected_codename}" ]]; then
+                        local major_minor=""
+                        major_minor="$(echo "${selected_truenas}" | grep -oP '^\d+\.\d+' || true)"
+                        selected_codename="${VERSION_TO_CODENAME[${major_minor}]:-}"
+                    fi
+                fi
+                ;;
+            nvidia)
+                if fetch_nvidia_versions; then
+                    local -a nvidia_menu_args=()
+                    for ver in "${NVIDIA_VERSIONS[@]}"; do
+                        nvidia_menu_args+=("${ver}" "${NVIDIA_VERSION_TAGS[${ver}]:-}")
+                    done
+                    ui_menu selected_nvidia "NVIDIA Driver" \
+                        "Select new NVIDIA driver:" "${nvidia_menu_args[@]}"
+                fi
+                ;;
+            module)
+                if [[ "${UI_MODE}" == "whiptail" ]]; then
+                    wt_size
+                    selected_module_type=$(whiptail --title "Module Type" \
+                        --menu "Select kernel module type:" \
+                        ${WT_HEIGHT} ${WT_WIDTH} 2 \
+                        "open" "Recommended — open GPU kernel modules" \
+                        "proprietary" "Legacy closed-source kernel modules" \
+                        3>&1 1>&2 2>&3) || true
+                else
+                    PS3="  #? "
+                    select choice in "open (recommended)" "proprietary"; do
+                        case "${choice}" in
+                            "open"*) selected_module_type="open"; break ;;
+                            "proprietary") selected_module_type="proprietary"; break ;;
+                        esac
+                    done
+                fi
+                ;;
+            embed)
+                if ui_yesno "Embed" "Embed nvidia.raw in truenas.update?"; then
+                    selected_embed="true"
+                else
+                    selected_embed="false"
+                fi
+                ;;
+        esac
+
+        generate_compose_yaml \
+            "${selected_nvidia}" "${selected_truenas}" "${selected_codename}" \
+            "${selected_module_type}" "${selected_embed}" "${selected_cc}" \
+            "${compose_file}"
+        ok "docker-compose.yaml updated! (changed: ${reconfigure_what})"
+        return 0
+    fi
+
+    # ── Check for existing config ────────────────────────────────────────────
+    if [[ -f "${compose_file}" ]]; then
+        read_existing_config "${compose_file}"
+        if [[ -n "${EXISTING_NVIDIA}" ]] || [[ -n "${EXISTING_TRUENAS}" ]]; then
             echo -e "  ${YELLOW}Existing configuration found:${NC}"
-            [[ -n "${current_truenas}" ]] && echo -e "    TrueNAS : ${BOLD}${current_truenas}${NC}"
-            [[ -n "${current_nvidia}" ]]  && echo -e "    NVIDIA  : ${BOLD}${current_nvidia}${NC}"
+            [[ -n "${EXISTING_TRUENAS}" ]] && echo -e "    TrueNAS : ${BOLD}${EXISTING_TRUENAS}${NC}"
+            [[ -n "${EXISTING_NVIDIA}" ]]  && echo -e "    NVIDIA  : ${BOLD}${EXISTING_NVIDIA}${NC}"
+            echo -e "  ${DIM}Tip: use ${BOLD}--reconfigure${NC}${DIM} to quick-change a single setting.${NC}"
             echo ""
         fi
     fi
@@ -849,50 +1181,68 @@ main() {
 
     local selected_truenas="" selected_codename=""
 
-    if fetch_truenas_versions; then
-        # Build tag/description pairs for ui_menu
-        local -a truenas_menu_args=()
-        for ver in "${TRUENAS_VERSIONS[@]}"; do
-            local cn="${TRUENAS_VERSION_CODENAMES[${ver}]:-}"
-            local tag="${TRUENAS_VERSION_TAGS[${ver}]:-}"
-            local desc=""
-            [[ -n "${cn}" ]] && desc="${cn}"
-            [[ -n "${tag}" ]] && desc="${desc:+${desc}  }${tag}"
-            truenas_menu_args+=("${ver}" "${desc}")
-        done
+    # Use auto-detected version if available
+    if [[ -n "${DETECTED_TRUENAS_VERSION}" ]]; then
+        echo -e "  ${GREEN}Auto-detected:${NC} ${BOLD}${DETECTED_TRUENAS_VERSION}${NC}"
+        if ui_yesno "Auto-detect" \
+            "TrueNAS version ${DETECTED_TRUENAS_VERSION} was auto-detected.\n\nUse this version?" "true"
+        then
+            selected_truenas="${DETECTED_TRUENAS_VERSION}"
+            local major_minor=""
+            major_minor="$(echo "${selected_truenas}" | grep -oP '^\d+\.\d+' || true)"
+            selected_codename="${VERSION_TO_CODENAME[${major_minor}]:-}"
+        fi
+    fi
 
-        ui_menu selected_truenas \
-            "Step 1: TrueNAS Version" \
-            "Select the TrueNAS version you are running:" \
-            "${truenas_menu_args[@]}"
+    if [[ -z "${selected_truenas}" ]]; then
+        if fetch_truenas_versions; then
+            # Build tag/description pairs for ui_menu
+            local -a truenas_menu_args=()
+            for ver in "${TRUENAS_VERSIONS[@]}"; do
+                local cn="${TRUENAS_VERSION_CODENAMES[${ver}]:-}"
+                local tag="${TRUENAS_VERSION_TAGS[${ver}]:-}"
+                local desc=""
+                [[ -n "${cn}" ]] && desc="${cn}"
+                [[ -n "${tag}" ]] && desc="${desc:+${desc}  }${tag}"
+                truenas_menu_args+=("${ver}" "${desc}")
+            done
 
-        # Resolve codename
-        if [[ -n "${selected_truenas}" ]]; then
-            selected_codename="${TRUENAS_VERSION_CODENAMES[${selected_truenas}]:-}"
-            # If manually entered, try auto-detecting codename
-            if [[ -z "${selected_codename}" ]]; then
-                local major_minor=""
-                major_minor="$(echo "${selected_truenas}" | grep -oP '^\d+\.\d+' || true)"
-                selected_codename="${VERSION_TO_CODENAME[${major_minor}]:-}"
+            local truenas_prompt="Select the TrueNAS version you are running:"
+            [[ -n "${DETECTED_TRUENAS_VERSION}" ]] && \
+                truenas_prompt="Auto-detected: ${DETECTED_TRUENAS_VERSION} (not confirmed)\nSelect version:"
+
+            ui_menu selected_truenas \
+                "Step 1: TrueNAS Version" \
+                "${truenas_prompt}" \
+                "${truenas_menu_args[@]}"
+
+            # Resolve codename
+            if [[ -n "${selected_truenas}" ]]; then
+                selected_codename="${TRUENAS_VERSION_CODENAMES[${selected_truenas}]:-}"
                 if [[ -z "${selected_codename}" ]]; then
-                    ui_inputbox selected_codename \
-                        "Codename" \
-                        "Enter codename (leave empty for TrueNAS 26+):"
+                    local major_minor=""
+                    major_minor="$(echo "${selected_truenas}" | grep -oP '^\d+\.\d+' || true)"
+                    selected_codename="${VERSION_TO_CODENAME[${major_minor}]:-}"
+                    if [[ -z "${selected_codename}" ]]; then
+                        ui_inputbox selected_codename \
+                            "Codename" \
+                            "Enter codename (leave empty for TrueNAS 26+):"
+                    fi
                 fi
             fi
-        fi
-    else
-        warn "Failed to fetch version list. Please enter manually."
-        ui_inputbox selected_truenas \
-            "TrueNAS Version" \
-            "Enter TrueNAS version (e.g. 25.10.3.1):"
-        local major_minor=""
-        major_minor="$(echo "${selected_truenas}" | grep -oP '^\d+\.\d+' || true)"
-        selected_codename="${VERSION_TO_CODENAME[${major_minor}]:-}"
-        if [[ -z "${selected_codename}" ]]; then
-            ui_inputbox selected_codename \
-                "Codename" \
-                "Enter codename (leave empty for TrueNAS 26+):"
+        else
+            warn "Failed to fetch version list. Please enter manually."
+            ui_inputbox selected_truenas \
+                "TrueNAS Version" \
+                "Enter TrueNAS version (e.g. 25.10.3.1):"
+            local major_minor=""
+            major_minor="$(echo "${selected_truenas}" | grep -oP '^\d+\.\d+' || true)"
+            selected_codename="${VERSION_TO_CODENAME[${major_minor}]:-}"
+            if [[ -z "${selected_codename}" ]]; then
+                ui_inputbox selected_codename \
+                    "Codename" \
+                    "Enter codename (leave empty for TrueNAS 26+):"
+            fi
         fi
     fi
 
@@ -908,6 +1258,13 @@ main() {
     # ── Step 2: NVIDIA Driver Version ────────────────────────────────────────
     banner "Step 2: Select NVIDIA Driver Version"
 
+    # Show GPU hint if detected
+    if [[ -n "${DETECTED_GPU_MODEL}" ]]; then
+        echo -e "  ${GREEN}Detected GPU:${NC} NVIDIA ${DETECTED_GPU_MODEL}"
+        echo -e "  ${DIM}Tip: ★ Production Branch is recommended for most users.${NC}"
+        echo ""
+    fi
+
     local selected_nvidia=""
 
     if fetch_nvidia_versions; then
@@ -918,9 +1275,13 @@ main() {
             nvidia_menu_args+=("${ver}" "${tag}")
         done
 
+        local nvidia_prompt="Select the NVIDIA driver version to build:"
+        [[ -n "${DETECTED_GPU_MODEL}" ]] && \
+            nvidia_prompt="GPU: ${DETECTED_GPU_MODEL}\nSelect driver version:"
+
         ui_menu selected_nvidia \
             "Step 2: NVIDIA Driver Version" \
-            "Select the NVIDIA driver version to build:" \
+            "${nvidia_prompt}" \
             "${nvidia_menu_args[@]}"
     else
         warn "Failed to fetch version list. Please enter manually."
@@ -999,7 +1360,6 @@ main() {
     summary+="\n  Compiler Override  : ${selected_cc:-auto-detect}"
 
     if [[ "${UI_MODE}" == "whiptail" ]]; then
-        # Show summary in a msgbox (need to strip ANSI for whiptail)
         ui_msgbox "Configuration Summary" "$(echo -e "${summary}")"
     else
         echo -e "  ${GREEN}►${NC} TrueNAS Version   : ${BOLD}${selected_truenas}${NC}"

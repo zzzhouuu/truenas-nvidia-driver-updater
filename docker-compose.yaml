@@ -22,6 +22,9 @@ services:
       # true/false — when enabled, also generate a rebuilt truenas.update with
       # the bundled nvidia.raw replaced.
       - EMBED_NVIDIA_RAW_IN_UPDATE=${EMBED_NVIDIA_RAW_IN_UPDATE:-false}
+    # Force standard runtime — TrueNAS may default to nvidia-container-runtime,
+    # which fails when the driver is being rebuilt (chicken-and-egg).
+    runtime: runc
     volumes:
       # If truenas.update exists here, it will be used instead of downloading
       - .:/workspace
